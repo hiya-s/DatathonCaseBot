@@ -5,6 +5,47 @@ import os
 from case_closed_game import Game, Direction, GameResult
 import random
 
+def render_board_colored(game, use_emojis=False):
+    BLUE = "\033[94m"   # bright blue
+    RED  = "\033[91m"   # bright red
+    PURP = "\033[95m"   # magenta (rare overlap/head-on)
+    RESET = "\033[0m"
+
+    a1 = set(game.agent1.get_trail_positions())
+    a2 = set(game.agent2.get_trail_positions())
+
+    h = game.board.height
+    w = game.board.width
+    lines = []
+
+    for y in range(h):
+        row = []
+        for x in range(w):
+            pos = (x, y)
+            if use_emojis:
+                if pos in a1 and pos in a2:
+                    cell = "🟪"         # overlap/head-on (should be rare)
+                elif pos in a1:
+                    cell = "🟦"         # your agent
+                elif pos in a2:
+                    cell = "🟥"         # opponent
+                else:
+                    cell = "⬜"
+            else:
+                if pos in a1 and pos in a2:
+                    cell = f"{PURP}X{RESET}"
+                elif pos in a1:
+                    cell = f"{BLUE}A{RESET}"
+                elif pos in a2:
+                    cell = f"{RED}A{RESET}"
+                else:
+                    cell = "."
+            row.append(cell)
+        lines.append(" ".join(row))
+    return "\n".join(lines)
+
+
+
 class RandomPlayer:
     def __init__(self, player_id=1):
         self.player_id = player_id
@@ -72,6 +113,7 @@ class Judge:
             return False
 
         return True
+
 
     def send_state(self, player_num):
         """Send current game state to a player via POST"""
@@ -334,7 +376,9 @@ def main():
         judge.send_state(2)
         
         # Display current board state
-        print(judge.game.board)
+        # print(judge.game.board)
+        print(render_board_colored(judge.game, use_emojis=False))
+
         print(f"Agent 1: Trail Length={judge.game.agent1.length}, Alive={judge.game.agent1.alive}, Boosts={judge.game.agent1.boosts_remaining}")
         print(f"Agent 2: Trail Length={judge.game.agent2.length}, Alive={judge.game.agent2.alive}, Boosts={judge.game.agent2.boosts_remaining}")
         

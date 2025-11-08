@@ -44,14 +44,35 @@ class GameBoard:
         
         return random.choice(empty_cells)
 
-    def __str__(self) -> str:
-        chars = {EMPTY: '.', AGENT: 'A'}
-        board_str = ""
-        for y in range(self.height):
-            for x in range(self.width):
-                board_str += chars.get(self.grid[y][x], '?') + ' '
-            board_str += '\n'
-        return board_str
+    # def __str__(self) -> str:
+    #     chars = {EMPTY: '.', AGENT: 'A'}
+    #     board_str = ""
+    #     for y in range(self.height):
+    #         for x in range(self.width):
+    #             board_str += chars.get(self.grid[y][x], '?') + ' '
+    #         board_str += '\n'
+    #     return board_str
+
+def __str__(self) -> str:
+    # ANSI escape codes for color
+    BLUE = "\033[94m"   # bright blue
+    RED = "\033[91m"    # bright red
+    RESET = "\033[0m"
+
+    board_str = ""
+    for y in range(self.height):
+        for x in range(self.width):
+            cell = self.grid[y][x]
+            pos = (x, y)
+            # show agent1 trail in BLUE, agent2 trail in RED
+            if pos in self.agent1.trail:
+                board_str += f"{BLUE}A{RESET} "
+            elif pos in self.agent2.trail:
+                board_str += f"{RED}A{RESET} "
+            else:
+                board_str += ". "
+        board_str += "\n"
+    return board_str
 
 
 UP = (0, -1)

@@ -314,82 +314,154 @@ def evaluate_with_lookahead(my_pos, opp_pos, occupied_cells, my_dir, opp_dir, di
 
 @app.route("/send-move", methods=["GET"])
 def send_move():
-    """Judge calls this (GET) to request the agent's move for the current tick."""
+    """Fast survival + space control agent (no minimax, instant response)."""
     player_number = request.args.get("player_number", default=1, type=int)
-    start_time = time.time()
 
     with game_lock:
-        state = dict(LAST_POSTED_STATE)   
+        state = dict(LAST_POSTED_STATE)
         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
-        opponent_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
-        
-        boosts_remaining = my_agent.boosts_remaining
-        turn_count = state.get("turn_count", 0)
-        
-        # Get positions and trails
+        opp_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
+
         my_trail = list(my_agent.trail)
-        opponent_trail = list(opponent_agent.trail)
-        
+        opp_trail = list(opp_agent.trail)
         if not my_trail:
             return jsonify({"move": "RIGHT"}), 200
-        
+
         my_pos = my_trail[-1]
-        opponent_pos = opponent_trail[-1] if opponent_trail else (10, 9)
-        
-        # Build set of occupied cells
-        occupied_cells = set(my_trail + opponent_trail)
-        
-        # Get current directions
+        opp_pos = opp_trail[-1] if opp_trail else (10, 9)
         my_dir = get_current_direction(my_trail)
-        opp_dir = get_current_direction(opponent_trail) if len(opponent_trail) >= 2 else "LEFT"
-        
-        # Get safe moves first
-        safe_moves = get_safe_moves(my_pos, my_dir, occupied_cells)
-        
-        if not safe_moves:
-            # Emergency: no safe moves, try anything
+        occupied = set(my_trail + opp_trail)
+
+        # --- quick helper: how much free space reachable from a position ---
+        def flood_score(pos):
+            q = deque([pos])
+            seen = {pos}
+            while q and len(seen) < 300:  # capped BFS for speed
+                x, y = q.popleft()
+                for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+                    nx, ny = (x+dx) % BOARD_WIDTH, (y+dy) % BOARD_HEIGHT
+                    if (nx, ny) not in occupied and (nx, ny) not in seen:
+                        seen.add((nx, ny))
+                        q.append((nx, ny))
+            return len(seen)
+
+        # --- generate valid safe moves ---
+        dirs = ["UP","DOWN","LEFT","RIGHT"]
+        safe = [d for d in dirs
+                if is_valid_move(my_dir, d)
+                and get_next_position(my_pos, d) not in occupied]
+
+        if not safe:
             return jsonify({"move": my_dir}), 200
-        
-        # If only one safe move, take it
-        if len(safe_moves) == 1:
-            move = safe_moves[0]
-            return jsonify({"move": move}), 200
-        
-        # Evaluate all safe moves
-        best_move = safe_moves[0]
-        best_score = -999999
-        
-        for direction in safe_moves:
-            score = evaluate_with_lookahead(my_pos, opponent_pos, occupied_cells, 
-                                           my_dir, opp_dir, direction, start_time)
-            
+        if len(safe) == 1:
+            return jsonify({"move": safe[0]}), 200
+
+        # --- pick move with most reachable area ---
+        best_move, best_score = safe[0], -1
+        for d in safe:
+            nxt = get_next_position(my_pos, d)
+            score = flood_score(nxt)
             if score > best_score:
-                best_score = score
-                best_move = direction
-        
-        # Decide on boost usage
+                best_move, best_score = d, score
+
+        # --- boost logic ---
         use_boost = False
-        
-        # Use boost strategically
-        if boosts_remaining > 0:
-            # Use boost if we're in a tight spot (few safe moves)
-            if len(safe_moves) <= 2:
+        if my_agent.boosts_remaining > 0:
+            # use boost only when boxed in
+            if len(safe) <= 2:
                 use_boost = True
-            
-            # Use boost early to claim territory
-            elif turn_count < 50 and turn_count % 15 == 0:
+            elif state.get("turn_count", 0) % 30 == 0:
                 use_boost = True
-            
-            # Use boost if territory count is close
-            elif turn_count > 50:
-                my_territory, opp_territory = flood_fill_with_territories(my_pos, opponent_pos, occupied_cells)
-                if abs(my_territory - opp_territory) < 20:
-                    use_boost = True
-        
-        # Format move
+
         move = f"{best_move}:BOOST" if use_boost else best_move
 
     return jsonify({"move": move}), 200
+
+# @app.route("/send-move", methods=["GET"])
+# def send_move():
+#     """Improved survival + area-control agent."""
+#     player_number = request.args.get("player_number", default=1, type=int)
+
+#     with game_lock:
+#         state = dict(LAST_POSTED_STATE)
+#         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
+#         opp_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
+
+#         my_trail = list(my_agent.trail)
+#         opp_trail = list(opp_agent.trail)
+#         my_pos = my_trail[-1]
+#         opp_pos = opp_trail[-1] if opp_trail else (10, 9)
+#         my_dir = get_current_direction(my_trail)
+#         occupied = set(my_trail + opp_trail)
+
+#         BOARD_W, BOARD_H = 20, 18
+#         dirs = ["UP", "DOWN", "LEFT", "RIGHT"]
+
+#         def flood_score(pos):
+#             """Fast BFS-based area count."""
+#             from collections import deque
+#             q = deque([pos])
+#             seen = {pos}
+#             while q and len(seen) < 250:
+#                 x, y = q.popleft()
+#                 for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+#                     nx, ny = (x+dx) % BOARD_W, (y+dy) % BOARD_H
+#                     if (nx, ny) not in occupied and (nx, ny) not in seen:
+#                         seen.add((nx, ny))
+#                         q.append((nx, ny))
+#             return len(seen)
+
+#         def wall_distance(pos):
+#             """How close we are to the nearest wall or trail."""
+#             from math import inf
+#             x, y = pos
+#             dists = [x, BOARD_W - 1 - x, y, BOARD_H - 1 - y]
+#             min_wall = min(dists)
+#             near_trail = min(
+#                 (abs(x - tx) + abs(y - ty))
+#                 for (tx, ty) in occupied
+#                 if (tx, ty) != pos
+#             )
+#             return min(min_wall, near_trail)
+
+#         def manhattan(a, b):
+#             return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+#         safe_moves = []
+#         for d in dirs:
+#             if not is_valid_move(my_dir, d):
+#                 continue
+#             nxt = get_next_position(my_pos, d)
+#             if nxt not in occupied:
+#                 safe_moves.append(d)
+
+#         if not safe_moves:
+#             return jsonify({"move": my_dir}), 200
+
+#         best_move = None
+#         best_score = -1
+
+#         for d in safe_moves:
+#             nxt = get_next_position(my_pos, d)
+#             space = flood_score(nxt)
+#             wall_safety = wall_distance(nxt)
+#             opp_proximity = manhattan(nxt, opp_pos)
+#             # balance survival (space + wall distance) with keeping distance from opp
+#             score = space + (5 * wall_safety) - (3 * max(0, 10 - opp_proximity))
+#             if score > best_score:
+#                 best_score = score
+#                 best_move = d
+
+#         # Smarter boost logic
+#         use_boost = False
+#         if my_agent.boosts_remaining > 0:
+#             if len(safe_moves) <= 2 or wall_distance(my_pos) <= 2:
+#                 use_boost = True
+
+#         move = f"{best_move}:BOOST" if use_boost else best_move
+
+#     return jsonify({"move": move}), 200
+
 
 
 @app.route("/end", methods=["POST"])
@@ -403,4 +475,4 @@ def end_game():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5008"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
