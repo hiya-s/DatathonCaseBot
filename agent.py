@@ -1,8 +1,8 @@
 import os
-import uuid
 from flask import Flask, request, jsonify
 from threading import Lock
 from collections import deque
+import time
 
 from case_closed_game import Game, Direction, GameResult
 
@@ -15,25 +15,21 @@ LAST_POSTED_STATE = {}
 game_lock = Lock()
  
 PARTICIPANT = "ParticipantX"
-AGENT_NAME = "AgentX"
+AGENT_NAME = "OptimalSurvivalAgent"
+
+# Game constants
+BOARD_WIDTH = 20
+BOARD_HEIGHT = 18
 
 
 @app.route("/", methods=["GET"])
 def info():
-    """Basic health/info endpoint used by the judge to check connectivity.
-
-    Returns participant and agent_name (so Judge.check_latency can create Agent objects).
-    """
+    """Basic health/info endpoint used by the judge to check connectivity."""
     return jsonify({"participant": PARTICIPANT, "agent_name": AGENT_NAME}), 200
 
 
 def _update_local_game_from_post(data: dict):
-    """Update the local GLOBAL_GAME using the JSON posted by the judge.
-
-    The judge posts a dictionary with keys matching the Judge.send_state payload
-    (board, agent1_trail, agent2_trail, agent1_length, agent2_length, agent1_alive,
-    agent2_alive, agent1_boosts, agent2_boosts, turn_count).
-    """
+    """Update the local GLOBAL_GAME using the JSON posted by the judge."""
     with game_lock:
         LAST_POSTED_STATE.clear()
         LAST_POSTED_STATE.update(data)
@@ -66,10 +62,7 @@ def _update_local_game_from_post(data: dict):
 
 @app.route("/send-state", methods=["POST"])
 def receive_state():
-    """Judge calls this to push the current game state to the agent server.
-
-    The agent should update its local representation and return 200.
-    """
+    """Judge calls this to push the current game state to the agent server."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "no json body"}), 400
@@ -77,44 +70,331 @@ def receive_state():
     return jsonify({"status": "state received"}), 200
 
 
+def normalize_position(pos):
+    """Apply torus wrapping to coordinates."""
+    return (pos[0] % BOARD_WIDTH, pos[1] % BOARD_HEIGHT)
+
+
+def get_next_position(pos, direction):
+    """Calculate next position given current position and direction."""
+    direction_map = {
+        "UP": (0, -1),
+        "DOWN": (0, 1),
+        "LEFT": (-1, 0),
+        "RIGHT": (1, 0)
+    }
+    dx, dy = direction_map[direction]
+    return normalize_position((pos[0] + dx, pos[1] + dy))
+
+
+def is_valid_move(current_dir, new_dir):
+    """Check if new direction is valid (not opposite to current)."""
+    opposites = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+    return new_dir != opposites.get(current_dir)
+
+
+def get_opposite_direction(direction):
+    """Get opposite direction."""
+    opposites = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+    return opposites.get(direction, "UP")
+
+
+def flood_fill_with_territories(my_pos, opp_pos, occupied_cells):
+    """
+    Flood fill from both positions to determine territory control.
+    Returns (my_territory, opp_territory, neutral_territory)
+    """
+    my_visited = {my_pos}
+    opp_visited = {opp_pos}
+    
+    my_queue = deque([my_pos])
+    opp_queue = deque([opp_pos])
+    
+    # BFS from both positions simultaneously
+    while my_queue or opp_queue:
+        # Expand my territory
+        if my_queue:
+            for _ in range(len(my_queue)):
+                pos = my_queue.popleft()
+                
+                for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                    next_pos = normalize_position((pos[0] + dx, pos[1] + dy))
+                    
+                    if next_pos not in occupied_cells and next_pos not in my_visited and next_pos not in opp_visited:
+                        my_visited.add(next_pos)
+                        my_queue.append(next_pos)
+        
+        # Expand opponent territory
+        if opp_queue:
+            for _ in range(len(opp_queue)):
+                pos = opp_queue.popleft()
+                
+                for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                    next_pos = normalize_position((pos[0] + dx, pos[1] + dy))
+                    
+                    if next_pos not in occupied_cells and next_pos not in my_visited and next_pos not in opp_visited:
+                        opp_visited.add(next_pos)
+                        opp_queue.append(next_pos)
+    
+    return len(my_visited), len(opp_visited)
+
+
+def minimax_evaluate(my_pos, opp_pos, occupied_cells, depth, is_my_turn, my_dir, opp_dir, alpha, beta, start_time, time_limit=0.5):
+    """
+    Minimax with alpha-beta pruning to look ahead several moves.
+    Returns the score of the position.
+    """
+    # Time cutoff
+    if time.time() - start_time > time_limit:
+        my_territory, opp_territory = flood_fill_with_territories(my_pos, opp_pos, occupied_cells)
+        return my_territory - opp_territory
+    
+    # Base case: depth limit reached
+    if depth == 0:
+        my_territory, opp_territory = flood_fill_with_territories(my_pos, opp_pos, occupied_cells)
+        return my_territory - opp_territory
+    
+    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
+    
+    if is_my_turn:
+        max_eval = -999999
+        
+        for direction in directions:
+            if not is_valid_move(my_dir, direction):
+                continue
+            
+            next_pos = get_next_position(my_pos, direction)
+            
+            # Check if move causes collision
+            if next_pos in occupied_cells:
+                continue  # Skip this move
+            
+            # Simulate move
+            new_occupied = occupied_cells | {next_pos}
+            
+            eval_score = minimax_evaluate(next_pos, opp_pos, new_occupied, depth - 1, False, 
+                                         direction, opp_dir, alpha, beta, start_time, time_limit)
+            
+            max_eval = max(max_eval, eval_score)
+            alpha = max(alpha, eval_score)
+            
+            if beta <= alpha:
+                break  # Beta cutoff
+        
+        return max_eval if max_eval > -999999 else -999999
+    
+    else:  # Opponent's turn
+        min_eval = 999999
+        
+        for direction in directions:
+            if not is_valid_move(opp_dir, direction):
+                continue
+            
+            next_pos = get_next_position(opp_pos, direction)
+            
+            # Check if move causes collision
+            if next_pos in occupied_cells:
+                continue
+            
+            # Simulate move
+            new_occupied = occupied_cells | {next_pos}
+            
+            eval_score = minimax_evaluate(my_pos, next_pos, new_occupied, depth - 1, True,
+                                         my_dir, direction, alpha, beta, start_time, time_limit)
+            
+            min_eval = min(min_eval, eval_score)
+            beta = min(beta, eval_score)
+            
+            if beta <= alpha:
+                break  # Alpha cutoff
+        
+        return min_eval if min_eval < 999999 else 999999
+
+
+def space_filling_heuristic(pos, occupied_cells, direction, current_dir):
+    """
+    Heuristic to encourage space-filling patterns (spirals, zigzags).
+    """
+    score = 0
+    
+    # Strongly prefer avoiding occupied cells
+    next_pos = get_next_position(pos, direction)
+    if next_pos in occupied_cells:
+        return -100000
+    
+    # Check 2 steps ahead
+    next_next_pos = get_next_position(next_pos, direction)
+    if next_next_pos in occupied_cells:
+        score -= 5000
+    
+    # Count free neighbors around next position (more free = better)
+    free_neighbors = 0
+    for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+        neighbor = normalize_position((next_pos[0] + dx, next_pos[1] + dy))
+        if neighbor not in occupied_cells:
+            free_neighbors += 1
+    
+    score += free_neighbors * 100
+    
+    # Prefer making right-angle turns periodically for space-filling
+    # This creates a zigzag/spiral pattern
+    if direction != current_dir and is_valid_move(current_dir, direction):
+        score += 50  # Bonus for turning
+    
+    return score
+
+
+def get_current_direction(trail):
+    """Determine current direction from trail."""
+    if len(trail) < 2:
+        return "RIGHT"
+    
+    prev = trail[-2]
+    head = trail[-1]
+    dx = head[0] - prev[0]
+    dy = head[1] - prev[1]
+    
+    # Normalize for torus wrapping
+    if abs(dx) > 1:
+        dx = -1 if dx > 0 else 1
+    if abs(dy) > 1:
+        dy = -1 if dy > 0 else 1
+    
+    if dx == 1:
+        return "RIGHT"
+    elif dx == -1:
+        return "LEFT"
+    elif dy == 1:
+        return "DOWN"
+    elif dy == -1:
+        return "UP"
+    
+    return "RIGHT"
+
+
+def get_safe_moves(pos, current_dir, occupied_cells):
+    """Get all moves that don't immediately cause collision."""
+    safe_moves = []
+    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
+    
+    for direction in directions:
+        if not is_valid_move(current_dir, direction):
+            continue
+        
+        next_pos = get_next_position(pos, direction)
+        if next_pos not in occupied_cells:
+            safe_moves.append(direction)
+    
+    return safe_moves
+
+
+def evaluate_with_lookahead(my_pos, opp_pos, occupied_cells, my_dir, opp_dir, direction, start_time):
+    """Evaluate a move using minimax with territory control."""
+    if not is_valid_move(my_dir, direction):
+        return -100000
+    
+    next_pos = get_next_position(my_pos, direction)
+    
+    if next_pos in occupied_cells:
+        return -100000
+    
+    # Simulate the move
+    new_occupied = occupied_cells | {next_pos}
+    
+    # Use minimax to look ahead
+    depth = 4  # Look 4 moves ahead
+    score = minimax_evaluate(next_pos, opp_pos, new_occupied, depth, False, 
+                            direction, opp_dir, -999999, 999999, start_time, time_limit=0.8)
+    
+    # Add space-filling heuristic
+    space_score = space_filling_heuristic(my_pos, occupied_cells, direction, my_dir)
+    
+    return score + space_score
+
+
 @app.route("/send-move", methods=["GET"])
 def send_move():
-    """Judge calls this (GET) to request the agent's move for the current tick.
-
-    Query params the judge sends (optional): player_number, attempt_number,
-    random_moves_left, turn_count. Agents can use this to decide.
-    
-    Return format: {"move": "DIRECTION"} or {"move": "DIRECTION:BOOST"}
-    where DIRECTION is UP, DOWN, LEFT, or RIGHT
-    and :BOOST is optional to use a speed boost (move twice)
-    """
+    """Judge calls this (GET) to request the agent's move for the current tick."""
     player_number = request.args.get("player_number", default=1, type=int)
+    start_time = time.time()
 
     with game_lock:
         state = dict(LAST_POSTED_STATE)   
         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
+        opponent_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
+        
         boosts_remaining = my_agent.boosts_remaining
-   
-    # -----------------your code here-------------------
-    # Simple example: always go RIGHT (replace this with your logic)
-    # To use a boost: move = "RIGHT:BOOST"
-    move = "RIGHT"
-    
-    # Example: Use boost if available and it's late in the game
-    # turn_count = state.get("turn_count", 0)
-    # if boosts_remaining > 0 and turn_count > 50:
-    #     move = "RIGHT:BOOST"
-    # -----------------end code here--------------------
+        turn_count = state.get("turn_count", 0)
+        
+        # Get positions and trails
+        my_trail = list(my_agent.trail)
+        opponent_trail = list(opponent_agent.trail)
+        
+        if not my_trail:
+            return jsonify({"move": "RIGHT"}), 200
+        
+        my_pos = my_trail[-1]
+        opponent_pos = opponent_trail[-1] if opponent_trail else (10, 9)
+        
+        # Build set of occupied cells
+        occupied_cells = set(my_trail + opponent_trail)
+        
+        # Get current directions
+        my_dir = get_current_direction(my_trail)
+        opp_dir = get_current_direction(opponent_trail) if len(opponent_trail) >= 2 else "LEFT"
+        
+        # Get safe moves first
+        safe_moves = get_safe_moves(my_pos, my_dir, occupied_cells)
+        
+        if not safe_moves:
+            # Emergency: no safe moves, try anything
+            return jsonify({"move": my_dir}), 200
+        
+        # If only one safe move, take it
+        if len(safe_moves) == 1:
+            move = safe_moves[0]
+            return jsonify({"move": move}), 200
+        
+        # Evaluate all safe moves
+        best_move = safe_moves[0]
+        best_score = -999999
+        
+        for direction in safe_moves:
+            score = evaluate_with_lookahead(my_pos, opponent_pos, occupied_cells, 
+                                           my_dir, opp_dir, direction, start_time)
+            
+            if score > best_score:
+                best_score = score
+                best_move = direction
+        
+        # Decide on boost usage
+        use_boost = False
+        
+        # Use boost strategically
+        if boosts_remaining > 0:
+            # Use boost if we're in a tight spot (few safe moves)
+            if len(safe_moves) <= 2:
+                use_boost = True
+            
+            # Use boost early to claim territory
+            elif turn_count < 50 and turn_count % 15 == 0:
+                use_boost = True
+            
+            # Use boost if territory count is close
+            elif turn_count > 50:
+                my_territory, opp_territory = flood_fill_with_territories(my_pos, opponent_pos, occupied_cells)
+                if abs(my_territory - opp_territory) < 20:
+                    use_boost = True
+        
+        # Format move
+        move = f"{best_move}:BOOST" if use_boost else best_move
 
     return jsonify({"move": move}), 200
 
 
 @app.route("/end", methods=["POST"])
 def end_game():
-    """Judge notifies agent that the match finished and provides final state.
-
-    We update local state for record-keeping and return OK.
-    """
+    """Judge notifies agent that the match finished and provides final state."""
     data = request.get_json()
     if data:
         _update_local_game_from_post(data)
