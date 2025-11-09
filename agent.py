@@ -2,6 +2,7 @@ import os
 from flask import Flask, request, jsonify
 from threading import Lock
 from collections import deque
+import time
 
 from case_closed_game import Game, Direction, GameResult
 
@@ -14,7 +15,7 @@ LAST_POSTED_STATE = {}
 game_lock = Lock()
  
 PARTICIPANT = "ParticipantX"
-AGENT_NAME = "AggressiveSpaceAgent"
+AGENT_NAME = "OptimalSurvivalAgent"
 
 # Game constants
 BOARD_WIDTH = 20
@@ -92,156 +93,153 @@ def is_valid_move(current_dir, new_dir):
     return new_dir != opposites.get(current_dir)
 
 
-def flood_fill_fast(start_pos, occupied_cells, max_depth=50):
-    """Fast flood fill with depth limit for performance."""
-    visited = set()
-    queue = deque([(start_pos, 0)])
-    visited.add(start_pos)
-    count = 0
+def get_opposite_direction(direction):
+    """Get opposite direction."""
+    opposites = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+    return opposites.get(direction, "UP")
+
+
+def flood_fill_with_territories(my_pos, opp_pos, occupied_cells):
+    """
+    Flood fill from both positions to determine territory control.
+    Returns (my_territory, opp_territory, neutral_territory)
+    """
+    my_visited = {my_pos}
+    opp_visited = {opp_pos}
     
-    while queue:
-        pos, depth = queue.popleft()
-        count += 1
+    my_queue = deque([my_pos])
+    opp_queue = deque([opp_pos])
+    
+    # BFS from both positions simultaneously
+    while my_queue or opp_queue:
+        # Expand my territory
+        if my_queue:
+            for _ in range(len(my_queue)):
+                pos = my_queue.popleft()
+                
+                for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                    next_pos = normalize_position((pos[0] + dx, pos[1] + dy))
+                    
+                    if next_pos not in occupied_cells and next_pos not in my_visited and next_pos not in opp_visited:
+                        my_visited.add(next_pos)
+                        my_queue.append(next_pos)
         
-        if depth >= max_depth:
-            continue
+        # Expand opponent territory
+        if opp_queue:
+            for _ in range(len(opp_queue)):
+                pos = opp_queue.popleft()
+                
+                for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                    next_pos = normalize_position((pos[0] + dx, pos[1] + dy))
+                    
+                    if next_pos not in occupied_cells and next_pos not in my_visited and next_pos not in opp_visited:
+                        opp_visited.add(next_pos)
+                        opp_queue.append(next_pos)
+    
+    return len(my_visited), len(opp_visited)
+
+
+def minimax_evaluate(my_pos, opp_pos, occupied_cells, depth, is_my_turn, my_dir, opp_dir, alpha, beta, start_time, time_limit=0.5):
+    """
+    Minimax with alpha-beta pruning to look ahead several moves.
+    Returns the score of the position.
+    """
+    # Time cutoff
+    if time.time() - start_time > time_limit:
+        my_territory, opp_territory = flood_fill_with_territories(my_pos, opp_pos, occupied_cells)
+        return my_territory - opp_territory
+    
+    # Base case: depth limit reached
+    if depth == 0:
+        my_territory, opp_territory = flood_fill_with_territories(my_pos, opp_pos, occupied_cells)
+        return my_territory - opp_territory
+    
+    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
+    
+    if is_my_turn:
+        max_eval = -999999
         
-        # Check all four directions
-        for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
-            next_pos = normalize_position((pos[0] + dx, pos[1] + dy))
+        for direction in directions:
+            if not is_valid_move(my_dir, direction):
+                continue
             
-            if next_pos not in visited and next_pos not in occupied_cells:
-                visited.add(next_pos)
-                queue.append((next_pos, depth + 1))
+            next_pos = get_next_position(my_pos, direction)
+            
+            # Check if move causes collision
+            if next_pos in occupied_cells:
+                continue  # Skip this move
+            
+            # Simulate move
+            new_occupied = occupied_cells | {next_pos}
+            
+            eval_score = minimax_evaluate(next_pos, opp_pos, new_occupied, depth - 1, False, 
+                                         direction, opp_dir, alpha, beta, start_time, time_limit)
+            
+            max_eval = max(max_eval, eval_score)
+            alpha = max(alpha, eval_score)
+            
+            if beta <= alpha:
+                break  # Beta cutoff
+        
+        return max_eval if max_eval > -999999 else -999999
     
-    return count
+    else:  # Opponent's turn
+        min_eval = 999999
+        
+        for direction in directions:
+            if not is_valid_move(opp_dir, direction):
+                continue
+            
+            next_pos = get_next_position(opp_pos, direction)
+            
+            # Check if move causes collision
+            if next_pos in occupied_cells:
+                continue
+            
+            # Simulate move
+            new_occupied = occupied_cells | {next_pos}
+            
+            eval_score = minimax_evaluate(my_pos, next_pos, new_occupied, depth - 1, True,
+                                         my_dir, direction, alpha, beta, start_time, time_limit)
+            
+            min_eval = min(min_eval, eval_score)
+            beta = min(beta, eval_score)
+            
+            if beta <= alpha:
+                break  # Alpha cutoff
+        
+        return min_eval if min_eval < 999999 else 999999
 
 
-def predict_opponent_moves(opponent_pos, opponent_trail, occupied_cells):
-    """Predict likely opponent positions in next 1-2 moves."""
-    if len(opponent_trail) < 2:
-        return set()
+def space_filling_heuristic(pos, occupied_cells, direction, current_dir):
+    """
+    Heuristic to encourage space-filling patterns (spirals, zigzags).
+    """
+    score = 0
     
-    # Get opponent's current direction
-    prev = opponent_trail[-2]
-    head = opponent_trail[-1]
-    dx = head[0] - prev[0]
-    dy = head[1] - prev[1]
+    # Strongly prefer avoiding occupied cells
+    next_pos = get_next_position(pos, direction)
+    if next_pos in occupied_cells:
+        return -100000
     
-    # Normalize for torus
-    if abs(dx) > 1:
-        dx = -1 if dx > 0 else 1
-    if abs(dy) > 1:
-        dy = -1 if dy > 0 else 1
+    # Check 2 steps ahead
+    next_next_pos = get_next_position(next_pos, direction)
+    if next_next_pos in occupied_cells:
+        score -= 5000
     
-    # Predict next positions (straight, left turn, right turn)
-    predictions = set()
+    # Count free neighbors around next position (more free = better)
+    free_neighbors = 0
+    for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+        neighbor = normalize_position((next_pos[0] + dx, next_pos[1] + dy))
+        if neighbor not in occupied_cells:
+            free_neighbors += 1
     
-    # Straight ahead
-    next_pos = normalize_position((opponent_pos[0] + dx, opponent_pos[1] + dy))
-    if next_pos not in occupied_cells:
-        predictions.add(next_pos)
-        # Two moves ahead if straight
-        next_next = normalize_position((next_pos[0] + dx, next_pos[1] + dy))
-        if next_next not in occupied_cells:
-            predictions.add(next_next)
+    score += free_neighbors * 100
     
-    # Perpendicular moves (turns)
-    if dx != 0:  # Currently moving horizontally
-        for new_dy in [-1, 1]:
-            turn_pos = normalize_position((opponent_pos[0], opponent_pos[1] + new_dy))
-            if turn_pos not in occupied_cells:
-                predictions.add(turn_pos)
-    else:  # Currently moving vertically
-        for new_dx in [-1, 1]:
-            turn_pos = normalize_position((opponent_pos[0] + new_dx, opponent_pos[1]))
-            if turn_pos not in occupied_cells:
-                predictions.add(turn_pos)
-    
-    return predictions
-
-
-def evaluate_move_aggressive(my_pos, my_dir, opponent_pos, opponent_trail, direction, 
-                             occupied_cells, my_length, opp_length, turn_count, use_boost=False):
-    """Aggressive evaluation focusing on space control and survival."""
-    if not is_valid_move(my_dir, direction):
-        return -100000  # Invalid move
-    
-    # Simulate the move
-    moves = 2 if use_boost else 1
-    current_pos = my_pos
-    temp_occupied = set(occupied_cells)
-    
-    for step in range(moves):
-        next_pos = get_next_position(current_pos, direction)
-        
-        # Check if move leads to collision
-        if next_pos in temp_occupied:
-            return -50000  # Death
-        
-        temp_occupied.add(next_pos)
-        current_pos = next_pos
-    
-    # Fast flood fill to estimate reachable space
-    reachable = flood_fill_fast(current_pos, temp_occupied, max_depth=40)
-    
-    # Base score heavily weighted on reachable space
-    score = reachable * 100
-    
-    # Predict opponent's likely next positions
-    predicted_opp_positions = predict_opponent_moves(opponent_pos, opponent_trail, occupied_cells)
-    
-    # Penalty for getting too close to predicted opponent positions
-    min_pred_dist = float('inf')
-    for pred_pos in predicted_opp_positions:
-        dist = abs(current_pos[0] - pred_pos[0]) + abs(current_pos[1] - pred_pos[1])
-        min_pred_dist = min(min_pred_dist, dist)
-    
-    # Only penalize if very close
-    if min_pred_dist < 3:
-        score -= (3 - min_pred_dist) * 50
-    
-    # Bonus for claiming territory away from opponent
-    opp_dist = abs(current_pos[0] - opponent_pos[0]) + abs(current_pos[1] - opponent_pos[1])
-    
-    # Early game: explore and claim space
-    if turn_count < 30:
-        score += opp_dist * 5  # Move away from opponent
-        
-        # Prefer moves toward open space (edges initially)
-        edge_dist = min(current_pos[0], BOARD_WIDTH - current_pos[0],
-                       current_pos[1], BOARD_HEIGHT - current_pos[1])
-        score += edge_dist * 2  # Prefer moving toward edges in early game
-    
-    # Mid game: maximize territory control
-    elif turn_count < 100:
-        # Maintain optimal distance (not too close, not too far)
-        optimal_dist = 8
-        dist_penalty = abs(opp_dist - optimal_dist)
-        score -= dist_penalty * 3
-        
-        # Prefer central positions with more options
-        center_x, center_y = BOARD_WIDTH // 2, BOARD_HEIGHT // 2
-        dist_to_center = abs(current_pos[0] - center_x) + abs(current_pos[1] - center_y)
-        score -= dist_to_center * 2
-    
-    # Late game: focus on survival and space
-    else:
-        # If ahead, play safe
-        if my_length > opp_length:
-            score += reachable * 20  # Heavily favor open space
-        else:
-            # If behind, take more risks
-            score += opp_dist * 10
-    
-    # Bonus for continuing in same direction (fewer turns = faster expansion)
-    direction_value = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
-    if direction == my_dir:
-        score += 30  # Bonus for going straight
-    
-    # Small penalty for turning (wastes time)
-    else:
-        score -= 10
+    # Prefer making right-angle turns periodically for space-filling
+    # This creates a zigzag/spiral pattern
+    if direction != current_dir and is_valid_move(current_dir, direction):
+        score += 50  # Bonus for turning
     
     return score
 
@@ -274,100 +272,258 @@ def get_current_direction(trail):
     return "RIGHT"
 
 
+def get_safe_moves(pos, current_dir, occupied_cells):
+    """Get all moves that don't immediately cause collision."""
+    safe_moves = []
+    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
+    
+    for direction in directions:
+        if not is_valid_move(current_dir, direction):
+            continue
+        
+        next_pos = get_next_position(pos, direction)
+        if next_pos not in occupied_cells:
+            safe_moves.append(direction)
+    
+    return safe_moves
+
+
+def evaluate_with_lookahead(my_pos, opp_pos, occupied_cells, my_dir, opp_dir, direction, start_time):
+    """Evaluate a move using minimax with territory control."""
+    if not is_valid_move(my_dir, direction):
+        return -100000
+    
+    next_pos = get_next_position(my_pos, direction)
+    
+    if next_pos in occupied_cells:
+        return -100000
+    
+    # Simulate the move
+    new_occupied = occupied_cells | {next_pos}
+    
+    # Use minimax to look ahead
+    depth = 4  # Look 4 moves ahead
+    score = minimax_evaluate(next_pos, opp_pos, new_occupied, depth, False, 
+                            direction, opp_dir, -999999, 999999, start_time, time_limit=0.8)
+    
+    # Add space-filling heuristic
+    space_score = space_filling_heuristic(my_pos, occupied_cells, direction, my_dir)
+    
+    return score + space_score
+
+
 @app.route("/send-move", methods=["GET"])
 def send_move():
-    """Judge calls this (GET) to request the agent's move for the current tick."""
+    """Deep Q-learning inspired agent with advanced space evaluation."""
     player_number = request.args.get("player_number", default=1, type=int)
 
     with game_lock:
-        state = dict(LAST_POSTED_STATE)   
+        state = dict(LAST_POSTED_STATE)
         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
-        opponent_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
-        
-        boosts_remaining = my_agent.boosts_remaining
-        turn_count = state.get("turn_count", 0)
-        
-        # Get positions and trails
+        opp_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
+
         my_trail = list(my_agent.trail)
-        opponent_trail = list(opponent_agent.trail)
-        
-        my_length = my_agent.length
-        opp_length = opponent_agent.length
-        
+        opp_trail = list(opp_agent.trail)
         if not my_trail:
             return jsonify({"move": "RIGHT"}), 200
-        
+
         my_pos = my_trail[-1]
-        opponent_pos = opponent_trail[-1] if opponent_trail else (10, 9)
-        
-        # Build set of occupied cells
-        occupied_cells = set(my_trail + opponent_trail)
-        
-        # Get current direction
-        current_dir = get_current_direction(my_trail)
-        
-        # Evaluate all possible moves
-        directions = ["UP", "DOWN", "LEFT", "RIGHT"]
-        best_move = current_dir  # Default to continuing straight
-        best_score = -1000000
-        use_boost = False
-        
-        # Evaluate moves without boost
-        for direction in directions:
-            score = evaluate_move_aggressive(
-                my_pos, current_dir, opponent_pos, opponent_trail, direction,
-                occupied_cells, my_length, opp_length, turn_count, use_boost=False
+        opp_pos = opp_trail[-1] if opp_trail else (10, 9)
+        my_dir = get_current_direction(my_trail)
+        occupied = set(my_trail + opp_trail)
+
+        def deep_flood_score(pos, depth=3):
+            """Multi-level flood fill that looks ahead several moves."""
+            if depth == 0:
+                return 0
+            
+            score = 0
+            visited = {pos}
+            queue = deque([(pos, 1.0)])  # (position, weight)
+            
+            while queue:
+                current_pos, weight = queue.popleft()
+                score += weight  # Add weighted score for this position
+                
+                if depth > 1:  # Only explore further if we have depth remaining
+                    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+                        nx, ny = (current_pos[0] + dx) % BOARD_WIDTH, (current_pos[1] + dy) % BOARD_HEIGHT
+                        next_pos = (nx, ny)
+                        
+                        if next_pos not in visited and next_pos not in occupied:
+                            visited.add(next_pos)
+                            # Decay weight with distance to prioritize closer spaces
+                            next_weight = weight * 0.8
+                            queue.append((next_pos, next_weight))
+            
+            return score
+
+        def evaluate_move(pos, direction, opp_pos):
+            """Comprehensive move evaluation combining multiple factors."""
+            next_pos = get_next_position(pos, direction)
+            if next_pos in occupied:
+                return float('-inf')
+            
+            # Base space score from deep flood fill
+            space_score = deep_flood_score(next_pos)
+            
+            # Distance from opponent's trail (prefer staying away)
+            opp_distance = min(
+                abs(next_pos[0] - tx) + abs(next_pos[1] - ty)
+                for tx, ty in opp_trail
+            ) if opp_trail else BOARD_WIDTH
+            distance_score = min(opp_distance * 10, 100)  # Cap the distance score
+            
+            # Look ahead for future moves
+            future_moves = 0
+            future_pos = next_pos
+            future_visited = {pos, next_pos}
+            
+            for _ in range(3):  # Look 3 moves ahead
+                valid_futures = [
+                    get_next_position(future_pos, d)
+                    for d in ["UP", "DOWN", "LEFT", "RIGHT"]
+                    if is_valid_move(direction, d)
+                ]
+                valid_futures = [p for p in valid_futures if p not in occupied and p not in future_visited]
+                if not valid_futures:
+                    break
+                future_moves += len(valid_futures)
+                future_visited.update(valid_futures)
+            
+            # Combine scores with weights
+            total_score = (
+                space_score * 2.0 +          # Prioritize available space
+                distance_score * 0.5 +       # Moderate weight for opponent distance
+                future_moves * 15.0          # Good weight for future move options
             )
             
-            if score > best_score:
-                best_score = score
-                best_move = direction
-                use_boost = False
-        
-        # Consider boost moves
-        if boosts_remaining > 0:
-            # Use boosts more liberally
-            should_use_boost = False
-            
-            # Use boost in early game to claim territory fast
-            if turn_count < 40:
-                should_use_boost = True
-            
-            # Use boost if space is getting tight
-            elif best_score < 500:
-                should_use_boost = True
-            
-            # Use boost in mid-game for strategic advantage
-            elif 40 <= turn_count <= 120:
-                should_use_boost = turn_count % 30 < 10  # Use periodically
-            
-            # Use remaining boosts in late game
-            elif turn_count > 150 and boosts_remaining > 0:
-                should_use_boost = True
-            
-            if should_use_boost:
-                boost_best_score = -1000000
-                boost_best_move = best_move
-                
-                for direction in directions:
-                    score = evaluate_move_aggressive(
-                        my_pos, current_dir, opponent_pos, opponent_trail, direction,
-                        occupied_cells, my_length, opp_length, turn_count, use_boost=True
-                    )
-                    
-                    if score > boost_best_score:
-                        boost_best_score = score
-                        boost_best_move = direction
-                
-                # Use boost if it's better OR even similar (aggressive)
-                if boost_best_score >= best_score - 50:
-                    best_move = boost_best_move
-                    use_boost = True
-        
-        # Format move
-        move = f"{best_move}:BOOST" if use_boost else best_move
+            return total_score
 
+        # Generate and evaluate all valid moves
+        dirs = ["UP", "DOWN", "LEFT", "RIGHT"]
+        moves_with_scores = []
+        
+        for direction in dirs:
+            if not is_valid_move(my_dir, direction):
+                continue
+            
+            score = evaluate_move(my_pos, direction, opp_pos)
+            if score > float('-inf'):
+                moves_with_scores.append((direction, score))
+        
+        if not moves_with_scores:
+            return jsonify({"move": my_dir}), 200
+        
+        # Select best move
+        best_move, best_score = max(moves_with_scores, key=lambda x: x[1])
+        
+        # Smart boost usage
+        use_boost = False
+        if my_agent.boosts_remaining > 0:
+            current_space = deep_flood_score(my_pos)
+            next_pos = get_next_position(my_pos, best_move)
+            next_space = deep_flood_score(next_pos)
+            
+            # Use boost if:
+            # 1. We're getting boxed in (limited space)
+            # 2. Moving to a significantly better position
+            # 3. Early/mid game and good opportunity
+            if (current_space < 50 or                    # Boxing in
+                next_space > current_space * 1.5 or      # Much better position
+                (state.get("turn_count", 0) < 100 and    # Early/mid game
+                 next_space > BOARD_WIDTH * 2)):         # Good space ahead
+                use_boost = True
+
+        move = f"{best_move}:BOOST" if use_boost else best_move
+        
     return jsonify({"move": move}), 200
+
+# @app.route("/send-move", methods=["GET"])
+# def send_move():
+#     """Improved survival + area-control agent."""
+#     player_number = request.args.get("player_number", default=1, type=int)
+
+#     with game_lock:
+#         state = dict(LAST_POSTED_STATE)
+#         my_agent = GLOBAL_GAME.agent1 if player_number == 1 else GLOBAL_GAME.agent2
+#         opp_agent = GLOBAL_GAME.agent2 if player_number == 1 else GLOBAL_GAME.agent1
+
+#         my_trail = list(my_agent.trail)
+#         opp_trail = list(opp_agent.trail)
+#         my_pos = my_trail[-1]
+#         opp_pos = opp_trail[-1] if opp_trail else (10, 9)
+#         my_dir = get_current_direction(my_trail)
+#         occupied = set(my_trail + opp_trail)
+
+#         BOARD_W, BOARD_H = 20, 18
+#         dirs = ["UP", "DOWN", "LEFT", "RIGHT"]
+
+#         def flood_score(pos):
+#             """Fast BFS-based area count."""
+#             from collections import deque
+#             q = deque([pos])
+#             seen = {pos}
+#             while q and len(seen) < 250:
+#                 x, y = q.popleft()
+#                 for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+#                     nx, ny = (x+dx) % BOARD_W, (y+dy) % BOARD_H
+#                     if (nx, ny) not in occupied and (nx, ny) not in seen:
+#                         seen.add((nx, ny))
+#                         q.append((nx, ny))
+#             return len(seen)
+
+#         def wall_distance(pos):
+#             """How close we are to the nearest wall or trail."""
+#             from math import inf
+#             x, y = pos
+#             dists = [x, BOARD_W - 1 - x, y, BOARD_H - 1 - y]
+#             min_wall = min(dists)
+#             near_trail = min(
+#                 (abs(x - tx) + abs(y - ty))
+#                 for (tx, ty) in occupied
+#                 if (tx, ty) != pos
+#             )
+#             return min(min_wall, near_trail)
+
+#         def manhattan(a, b):
+#             return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+#         safe_moves = []
+#         for d in dirs:
+#             if not is_valid_move(my_dir, d):
+#                 continue
+#             nxt = get_next_position(my_pos, d)
+#             if nxt not in occupied:
+#                 safe_moves.append(d)
+
+#         if not safe_moves:
+#             return jsonify({"move": my_dir}), 200
+
+#         best_move = None
+#         best_score = -1
+
+#         for d in safe_moves:
+#             nxt = get_next_position(my_pos, d)
+#             space = flood_score(nxt)
+#             wall_safety = wall_distance(nxt)
+#             opp_proximity = manhattan(nxt, opp_pos)
+#             # balance survival (space + wall distance) with keeping distance from opp
+#             score = space + (5 * wall_safety) - (3 * max(0, 10 - opp_proximity))
+#             if score > best_score:
+#                 best_score = score
+#                 best_move = d
+
+#         # Smarter boost logic
+#         use_boost = False
+#         if my_agent.boosts_remaining > 0:
+#             if len(safe_moves) <= 2 or wall_distance(my_pos) <= 2:
+#                 use_boost = True
+
+#         move = f"{best_move}:BOOST" if use_boost else best_move
+
+#     return jsonify({"move": move}), 200
+
 
 
 @app.route("/end", methods=["POST"])
@@ -381,4 +537,4 @@ def end_game():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5008"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
